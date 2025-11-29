@@ -1,0 +1,94 @@
+{{ define "detailed" }}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ .Album.Album_name }}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+  div[style*="display: table-row;"]:nth-child(odd) {
+    background-color: #f9f9f9;
+  }
+  div[style*="display: table-row;"]:nth-child(even) {
+    background-color: #e9e9e9;
+  }
+</style>
+
+<script>
+document.addEventListener("DOMContentLoaded", function() {
+    const audioPlayer = document.getElementById("audio-player");
+    const currentSongLabel = document.getElementById("current-song");
+
+    document.querySelectorAll(".play-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+            const songID = btn.getAttribute("data-song-id");
+            const title = btn.getAttribute("data-title");
+
+            audioPlayer.src = `/stream/${songID}`;
+            audioPlayer.play();
+
+            currentSongLabel.textContent = `Playing: ${title}`;
+        });
+    });
+
+    audioPlayer.onplay = () => {
+        localStorage.setItem("currentSong", audioPlayer.src);
+        localStorage.setItem("currentTime", audioPlayer.currentTime);
+    };
+
+    const src = localStorage.getItem("currentSong");
+    const time = localStorage.getItem("currentTime");
+    if(src){
+        audioPlayer.src = src;
+        audioPlayer.currentTime = time || 0;
+    }
+});
+</script>
+</head>
+<body>
+    <div class="sidebar">
+        <a href="/library">← Back to library</a>
+    </div>
+    <div id="global-player" style="position: fixed; margin-left: 20%; top: 0; width: 70%; background: #111; color: white; z-index: 1000; padding: 0.5rem;">
+        <span id="current-song">No song playing</span>
+        <audio id="audio-player" controls style="width: 60%;">
+            Your browser does not support the audio element.
+        </audio>
+    </div>
+    <div style="width: 50rem; margin: 0 auto; text-align: center; padding-top: 4rem;">
+          <div class="" >
+          <h1>{{ .Album.Album_name }}</h1>
+          <p>by {{ .Album.Album_artist }} ({{ .Album.Album_date }})</p>
+          <img src="{{ .Album.Album_cover }}" alt="Album Cover" style="width:33vw; margin-bottom: 2rem;">
+      </div>
+
+      <div style="display: table; width: 100%; border-collapse: collapse;">
+        {{ range $i, $song := .Album.Songs }}
+          <div style="display: table-row;">
+            <div style="display: table-cell; padding: 0.5rem 1rem; text-align: left;">{{ .Title }}</div>
+            <div style="display: table-cell; padding: 0.5rem 1rem; text-align: right;">{{ .Duration }}</div>
+            <div style="display: table-cell; padding: 0.5rem 1rem; text-align: center;">
+              <form action="/song/delete/{{.SongID}}" method="post" style="display:inline;">
+              <button type="submit"
+                  onclick="return confirm('Delete this song from your library?')"
+                  style="background:none; border:none; color:red; font-weight:bold; cursor:pointer;">⨉
+              </button>
+              </form>
+            </div>
+            <div style="display: table-cell;">
+                <button class="play-btn" data-song-id="{{ .SongID }}" data-title="{{ .Title }}">▶ Play</button>
+            </div>
+          </div>
+          {{ end }}
+      </div>
+      <form action="/album/delete/{{ .Album.Album_id }}" method="post" style="margin-top: 1rem;">
+        <button type="submit"
+          onclick="return confirm('Are you sure you want to delete all your songs from this album?')"
+          style="width: 60%; border-radius: 0.6rem; padding: 0.5rem 1rem; background-color: #e74c3c; color: white; border: none; cursor: pointer;">
+          Delete Album
+        </button>
+      </form>
+    </div>
+</body>
+</html>
+{{ end }}

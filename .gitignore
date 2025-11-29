@@ -1,0 +1,8 @@
+# Go build
+Gin/bin/
+Gin/temp_metadata_edit/
+*.log
+*.tmp
+
+# OS/IDE
+.DS_Store

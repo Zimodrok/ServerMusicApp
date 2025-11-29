@@ -1,0 +1,86 @@
+{{ define "library" }}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Library</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll('.marquee').forEach(marquee => {
+    const contents = marquee.querySelectorAll('.marquee-content'); // all copies
+    contents.forEach(content => {
+      if (content.scrollWidth > marquee.clientWidth) {
+        content.classList.add('scroll');
+
+        // Calculate duration dynamically
+        const duration = content.scrollWidth / 20; // adjust divisor for speed
+        content.style.animationDuration = duration + 's';
+      } else {
+        content.classList.remove('scroll');
+        content.style.animationDuration = '';
+      }
+    });
+  });
+});
+</script>
+</head>
+<body class="page">
+    <div class="sidebar">
+        <h1>Music Library</h1>
+            <p>Welcome, {{ .Username }} 👋</p>
+        <div class="uploader">
+    <h2>Upload FLAC file</h2>
+<form action="/upload" method="post" enctype="multipart/form-data">
+<input type="file" id="file" name="files[]" accept=".flac" multiple required>
+    <label for="file">Select files</label>
+    <button type="submit">Upload</button>
+</form>
+</div>
+    </div>
+    <div id="global-player" style="position: fixed; margin-left: 20%; top: 0; width: 70%; background: #111; color: white; z-index: 1000; padding: 0.5rem;">
+        <span id="current-song">No song playing</span>
+        <audio id="audio-player" controls style="width: 60%;">
+            Your browser does not support the audio element.
+        </audio>
+    </div>
+    <div class="albums" style="margin-top: 7%;">
+        {{ range .Albums }}
+        <a href="/detailed/{{ .Album_id }}" class="album">
+        <div class="album">
+            <img class="album__img" src="{{ .Album_cover }}" alt="Album Cover">
+                        <div class="songs">
+                {{range .Songs}}
+                <div class="song">
+                    <span>{{.Title}}</span>
+                    <span>{{.Duration}}</span>
+                </div>
+                {{end}}
+            </div>
+            <div class="metadata">
+                <div class="album__body">{{ .Album_date }}</div>
+                <div class="marquee">
+                    <div class="marquee-content scroll">
+                        <div class="album__title">{{ .Album_name }}</div>
+                    </div>
+                    <div class="marquee-content scroll">
+                        <div class="album__title">{{ .Album_name }}</div>
+                    </div>
+                </div>
+                <div class="marquee">
+                    <div class="marquee-content scroll">
+                        <div class="album__meta">{{ .Album_artist }}</div>
+                    </div>
+                    <div class="marquee-content scroll">
+                        <div class="album__meta">{{ .Album_artist }}</div>
+                    </div>
+                </div>
+            </div>
+            <br>
+        </div>
+        </a>
+        {{ end }}
+    </div>
+</body>
+</html>
+{{ end }}

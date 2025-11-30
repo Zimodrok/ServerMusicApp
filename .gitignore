@@ -1,4 +1,4 @@
-# Go build
+# Build artifacts
 Gin/bin/
 Gin/temp_metadata_edit/
 *.log

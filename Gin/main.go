@@ -39,6 +39,7 @@ import (
 	"github.com/mewkiz/flac"
 	"github.com/mewkiz/flac/meta"
 	"github.com/pkg/sftp"
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -99,11 +100,122 @@ type TreeSong struct {
 	Albums map[string][]string `json:"albums"`
 }
 
+type uploadStore struct {
+	mu       sync.RWMutex
+	progress map[int][]UploadStatus
+	pending  map[int]map[string]*PendingAlbum
+}
+
+func newUploadStore() *uploadStore {
+	return &uploadStore{
+		progress: make(map[int][]UploadStatus),
+		pending:  make(map[int]map[string]*PendingAlbum),
+	}
+}
+
+func (s *uploadStore) ReplaceProgress(userID int, statuses []UploadStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cloned := make([]UploadStatus, len(statuses))
+	copy(cloned, statuses)
+	s.progress[userID] = cloned
+}
+
+func (s *uploadStore) UpdateMeta(userID int, originalFilename, artist, title string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := s.progress[userID]
+	for i := range items {
+		if items[i].Title == originalFilename {
+			items[i].Artist = artist
+			items[i].Title = title
+			break
+		}
+	}
+	s.progress[userID] = items
+}
+
+func (s *uploadStore) MarkDone(userID int, originalFilename string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := s.progress[userID]
+	for i := range items {
+		if items[i].OriginalFilename == originalFilename {
+			items[i].Done = true
+			break
+		}
+	}
+	s.progress[userID] = items
+}
+
+func (s *uploadStore) SetPending(userID int, pending map[string]*PendingAlbum) {
+	s.mu.Lock()
+	s.pending[userID] = pending
+	s.mu.Unlock()
+}
+
+func (s *uploadStore) Get(userID int) ([]UploadStatus, map[string]*PendingAlbum) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	progress := append([]UploadStatus(nil), s.progress[userID]...)
+	pending := s.pending[userID]
+	return progress, pending
+}
+
+type bucket struct {
+	count int
+	reset time.Time
+}
+
+type simpleLimiter struct {
+	mu      sync.Mutex
+	limit   int
+	window  time.Duration
+	buckets map[string]*bucket
+}
+
+func newSimpleLimiter(limit int, window time.Duration) *simpleLimiter {
+	return &simpleLimiter{
+		limit:   limit,
+		window:  window,
+		buckets: make(map[string]*bucket),
+	}
+}
+
+func (l *simpleLimiter) Allow(key string) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	b := l.buckets[key]
+	if b == nil || now.After(b.reset) {
+		l.buckets[key] = &bucket{count: 1, reset: now.Add(l.window)}
+		return true
+	}
+	if b.count >= l.limit {
+		return false
+	}
+	b.count++
+	return true
+}
+
+func sanitizeFilename(name string) string {
+	name = filepath.Base(name)
+	name = strings.ReplaceAll(name, "\\", "_")
+	name = strings.ReplaceAll(name, "/", "_")
+	name = strings.ReplaceAll(name, "..", "_")
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "upload"
+	}
+	return name
+}
+
 var (
-	db             *sql.DB
-	uploadProgress = make(map[int][]UploadStatus)
-	mu             sync.Mutex
-	pendingAlbums  = map[int]map[string]*PendingAlbum{}
+	db            *sql.DB
+	uploads       = newUploadStore()
+	loginLimiter  = newSimpleLimiter(10, time.Minute)
+	uploadLimiter = newSimpleLimiter(5, 5*time.Minute)
 )
 
 const (
@@ -113,6 +225,8 @@ const (
 	defaultLastName    = "User"
 	defaultEmail       = "guest@example.com"
 	defaultLibraryPath = "/guest/library"
+	maxUploadFileSize  = 200 << 20 // 200MB per file
+	maxUploadTotalSize = 512 << 20 // 512MB per request
 )
 
 func getUserByUsername(username string) (*sftpTools.User, error) {
@@ -129,6 +243,53 @@ func getUserByUsername(username string) (*sftpTools.User, error) {
 func hashPasswordSHA256(pw string) string {
 	h := sha256.Sum256([]byte(pw))
 	return hex.EncodeToString(h[:])
+}
+
+const bcryptCost = 12
+
+func hashPasswordBcrypt(input string) (string, error) {
+	hashed, err := bcrypt.GenerateFromPassword([]byte(input), bcryptCost)
+	return string(hashed), err
+}
+
+func isBcryptHash(h string) bool {
+	return strings.HasPrefix(h, "$2a$") || strings.HasPrefix(h, "$2b$") || strings.HasPrefix(h, "$2y$")
+}
+
+// verifyPassword accepts a password value as sent by the frontend (already hashed client-side)
+// and compares it against the stored hash. It supports legacy plain/sha256 stored hashes and
+// returns upgrade=true when the stored value should be replaced with bcrypt(incoming).
+func verifyPassword(storedHash, incoming string) (ok bool, upgrade bool) {
+	if storedHash == "" || incoming == "" {
+		return false, false
+	}
+
+	// Preferred: bcrypt compare
+	if isBcryptHash(storedHash) {
+		err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(incoming))
+		return err == nil, false
+	}
+
+	// Legacy: exact match (stored client-hash or stored sha256 of plaintext)
+	if storedHash == incoming {
+		return true, true
+	}
+
+	// Legacy SHA256 of incoming plaintext (if old clients sent plaintext)
+	if storedHash == hashPasswordSHA256(incoming) {
+		return true, true
+	}
+
+	return false, false
+}
+
+func upgradePasswordHash(userID int, newHash string) {
+	if newHash == "" {
+		return
+	}
+	if _, err := db.Exec(`UPDATE users SET password_hash=$1 WHERE uid=$2`, newHash, userID); err != nil {
+		log.Printf("[auth] failed to upgrade password hash for user=%d: %v", userID, err)
+	}
 }
 
 // func checkPasswordSHA256(stored, received string) bool {
@@ -159,7 +320,7 @@ func extractMetadataFromReader(r io.Reader, flacName string) (
 ) {
 	stream, err := flac.Parse(r)
 	if err != nil {
-		return flacName, "Unknown Album", "Unknown Genre", "Unknown Artist", "Unknown Year", "", "", ""
+		return flacName, "Unknown Album", "Unknown Genre", "Unknown Artist", "0", "", "", ""
 	}
 
 	for _, block := range stream.Blocks {
@@ -218,7 +379,7 @@ func extractMetadataFromReader(r io.Reader, flacName string) (
 		artist = "Unknown Artist"
 	}
 	if date == "" {
-		date = "Unknown Year"
+		date = "0"
 	}
 	if copyright == "" {
 		copyright = "Unknown legal owner, refer to " + artist
@@ -283,7 +444,11 @@ func ensureGuestUser() (*sftpTools.User, error) {
 	const defaultLastName = "User"
 	const defaultEmail = "guest@example.com"
 
-	defaultPassword := hashPasswordSHA256("guest")
+	clientGuestToken := hashPasswordSHA256("guest") // matches client-side guest token behavior
+	defaultPassword, errHash := hashPasswordBcrypt(clientGuestToken)
+	if errHash != nil {
+		return nil, fmt.Errorf("failed to hash guest password: %w", errHash)
+	}
 
 	var oldGuestID int
 	err := db.QueryRow(`SELECT uid FROM users WHERE username=$1`, defaultUsername).Scan(&oldGuestID)
@@ -338,13 +503,13 @@ func ensureGuestUser() (*sftpTools.User, error) {
 }
 
 func findPgBin() string {
-	candidates := []string{
+	paths := []string{
 		"/opt/homebrew/opt/postgresql@14/bin",
 		"/opt/homebrew/opt/postgresql/bin",
 		"/usr/local/opt/postgresql@14/bin",
 		"/usr/local/opt/postgresql/bin",
 	}
-	for _, dir := range candidates {
+	for _, dir := range paths {
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
 			return dir
 		}
@@ -353,6 +518,7 @@ func findPgBin() string {
 }
 
 func initLocalDBIfNeeded() {
+	tryStartPostgresService()
 	pgBin := findPgBin()
 	if pgBin == "" {
 		log.Printf("postgres binaries not found; skipping auto DB init")
@@ -367,8 +533,9 @@ func initLocalDBIfNeeded() {
 		_ = c.Run()
 	}
 
-	run(createuser, "-s", "musicuser")
-	run(createdb, "-O", "musicuser", "musicdb")
+	run(createuser, "--no-password", "--createdb", "musicuser")
+	run(psql, "-c", "ALTER USER musicuser WITH PASSWORD 'musicuser'")
+	run(createdb, "-O", "musicuser", "musicapp")
 
 	schemaCandidates := []string{
 		filepath.Join("sql", "schema.sql"),
@@ -382,8 +549,24 @@ func initLocalDBIfNeeded() {
 	}
 	for _, schemaPath := range schemaCandidates {
 		if _, err := os.Stat(schemaPath); err == nil {
-			run(psql, "-d", "musicdb", "-f", schemaPath)
+			run(psql, "-d", "musicapp", "-f", schemaPath)
 			break
+		}
+	}
+
+	// Ensure columns exist even if schema import was skipped/old.
+	run(psql, "-d", "musicapp", "-c", "ALTER TABLE users ADD COLUMN IF NOT EXISTS library_path text;")
+	run(psql, "-d", "musicapp", "-c", "ALTER TABLE users ADD COLUMN IF NOT EXISTS server_ip text;")
+}
+
+func ensureSchema(d *sql.DB) {
+	stmts := []string{
+		`ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS library_path text;`,
+		`ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS server_ip text;`,
+	}
+	for _, q := range stmts {
+		if _, err := d.Exec(q); err != nil {
+			log.Printf("schema ensure failed for %q: %v", q, err)
 		}
 	}
 }
@@ -729,7 +912,7 @@ func StreamSong(c *gin.Context) {
 
 	name := filepath.Base(remotePath)
 	err = sftpTools.WithSFTPFile(userID, remotePath, func(f *sftp.File, info os.FileInfo) error {
-		fmt.Println("[StreamSong] user=%d song=%d path=%s size=%d bytes\n",
+		fmt.Printf("[StreamSong] user=%d song=%d path=%s size=%d bytes\n",
 			userID, songID, remotePath, info.Size())
 		c.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", name))
 		c.Header("Content-Type", audioContentTypeFromName(name))
@@ -758,8 +941,9 @@ func generateRandomSessionID() string {
 	return hex.EncodeToString(b)
 }
 
-var consumerKey = "VUOxAzdEicDBOftGbPyW"
-var consumerSecret = "ORrKNsJuKlUOzemlXjdMiYfpGNLoisoi"
+// Discogs credentials are loaded from environment variables (DISCOGS_KEY/DISCOGS_SECRET).
+var consumerKey string
+var consumerSecret string
 
 func SearchReleases(artist, album string) ([]map[string]interface{}, error) {
 	strictResults, err := searchStrict(artist, album)
@@ -916,7 +1100,9 @@ func loadPortsConfig() (PortsConfig, error) {
 		}
 	}
 	if cfg.DBURL == "" {
-		cfg.DBURL = "postgres://musicuser:musicuser@localhost/musicdb?sslmode=disable"
+		cfg.DBURL = "postgres://musicuser:musicuser@localhost/musicapp?sslmode=disable"
+	} else if strings.Contains(cfg.DBURL, "musicdb") {
+		cfg.DBURL = strings.Replace(cfg.DBURL, "musicdb", "musicapp", 1)
 	}
 
 	if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
@@ -931,6 +1117,22 @@ func getEnv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+func loadAllowedOrigins() []string {
+	raw := os.Getenv("ALLOWED_ORIGINS")
+	if raw == "" {
+		return []string{"http://localhost:5173", "http://localhost:4173"}
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func init() {
@@ -964,11 +1166,13 @@ func main() {
 		portsConfig.SFTPPort = 9824
 	}
 
-	consumerKey = os.Getenv("DISCOGS_KEY")
-	consumerSecret = os.Getenv("DISCOGS_SECRET")
+	if key := os.Getenv("DISCOGS_KEY"); key != "" {
+		consumerKey = key
+	}
+	if secret := os.Getenv("DISCOGS_SECRET"); secret != "" {
+		consumerSecret = secret
+	}
 	databaseURL := getEnv("DATABASE_URL", portsConfig.DBURL)
-
-	// Attempt local DB bootstrap if using defaults
 	if databaseURL == "" || strings.Contains(databaseURL, "musicuser") {
 		initLocalDBIfNeeded()
 	}
@@ -977,23 +1181,43 @@ func main() {
 	if err != nil {
 		log.Printf("Failed to connect to DB: %v", err)
 	} else {
+		// Connection pool tuning for concurrent users.
+		db.SetMaxOpenConns(20)
+		db.SetMaxIdleConns(10)
+		db.SetConnMaxLifetime(30 * time.Minute)
+
 		tagedit.SetDB(db)
 		sftpTools.SetDB(db)
 		sftpTools.SetDefaultPort(portsConfig.SFTPPort)
+		ensureSchema(db)
+	}
+
+	allowedOrigins := loadAllowedOrigins()
+	allowedSet := make(map[string]struct{}, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		allowedSet[o] = struct{}{}
+	}
+	cookieSecure := strings.EqualFold(os.Getenv("COOKIE_SECURE"), "true")
+	sameSite := http.SameSiteLaxMode
+	if strings.EqualFold(os.Getenv("COOKIE_SAMESITE"), "strict") {
+		sameSite = http.SameSiteStrictMode
 	}
 
 	r := gin.Default()
 	r.Use(cors.New(cors.Config{
-		AllowOriginFunc:  func(origin string) bool { return true },
+		AllowOrigins:     allowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		AllowCredentials: true,
 	}))
-	r.MaxMultipartMemory = 512 << 20
+	// Cap multipart payloads to reduce memory pressure when multiple users upload.
+	r.MaxMultipartMemory = 256 << 20
 	r.Use(func(c *gin.Context) {
 		origin := c.Request.Header.Get("Origin")
 		if origin != "" {
-			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+			if _, ok := allowedSet[origin]; ok {
+				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+			}
 		}
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-CSRF-Token")
@@ -1218,6 +1442,8 @@ func main() {
 			return
 		}
 
+		log.Printf("[sftp/creds] user=%d host=%s port=%d username=%s path=%s", user.ID, creds.Host, creds.Port, creds.Username, creds.Path)
+
 		addr := fmt.Sprintf("%s:%d", creds.Host, creds.Port)
 		config := &ssh.ClientConfig{
 			User:            creds.Username,
@@ -1278,6 +1504,7 @@ func main() {
 		c.JSON(200, gin.H{
 			"connected": true,
 			"status":    "ok",
+			"path":      creds.Path,
 		})
 	})
 
@@ -1325,11 +1552,7 @@ func main() {
 			LibraryPath     string `json:"libraryPath"`
 		}
 		if err := c.ShouldBindJSON(&form); err != nil {
-			log.Printf("[register] invalid payload: %v", err)
-			c.JSON(400, gin.H{
-				"error":   "Invalid payload",
-				"details": err.Error(),
-			})
+			c.JSON(400, gin.H{"error": "Invalid payload"})
 			return
 		}
 
@@ -1351,13 +1574,18 @@ func main() {
 			return
 		}
 
-		hashed := hashPasswordSHA256(form.Password)
+		hashedPwd, err := hashPasswordBcrypt(form.Password)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to hash password"})
+			return
+		}
+
 		var userID int
 		err = db.QueryRow(`
         INSERT INTO users(username, password_hash, first_name, last_name, email, library_path, server_ip)
         VALUES($1,$2,$3,$4,$5,$6,$7)
         RETURNING uid
-    `, form.Username, hashed, form.FirstName, form.LastName, form.Email, form.LibraryPath, defaultServerIP).Scan(&userID)
+    `, form.Username, hashedPwd, form.FirstName, form.LastName, form.Email, form.LibraryPath, defaultServerIP).Scan(&userID)
 		if err != nil {
 			log.Printf("[register] create user failed username=%s email=%s: %v", form.Username, form.Email, err)
 			c.JSON(500, gin.H{
@@ -1378,12 +1606,18 @@ func main() {
 
 	r.POST("/login", func(c *gin.Context) {
 		var payload struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
+			Username   string `json:"username"`
+			Password   string `json:"password"`
+			RememberMe bool   `json:"rememberMe"`
 		}
 
 		if err := c.BindJSON(&payload); err != nil {
 			c.JSON(400, gin.H{"error": "Invalid payload"})
+			return
+		}
+
+		if !loginLimiter.Allow(c.ClientIP()) {
+			c.JSON(429, gin.H{"error": "Too many login attempts, please wait"})
 			return
 		}
 
@@ -1400,17 +1634,18 @@ func main() {
 
 			guestUser, err := ensureGuestUser()
 			if err != nil {
-				log.Printf("[login/guest] init guest failed: %v", err)
-				c.JSON(500, gin.H{
-					"error":   "Failed to initialize guest",
-					"details": err.Error(),
-				})
+				c.JSON(500, gin.H{"error": "Failed to initialize guest"})
 				return
 			}
 			sessionID := generateRandomSessionID()
 			sftpTools.Sessions[sessionID] = guestUser.ID
 
-			c.SetCookie("session_id", sessionID, 3600*24, "/", "", false, true)
+			maxAge := 3600 * 24
+			if payload.RememberMe {
+				maxAge = 3600 * 24 * 30
+			}
+			c.SetSameSite(sameSite)
+			c.SetCookie("session_id", sessionID, maxAge, "/", "", cookieSecure, true)
 
 			c.JSON(200, gin.H{
 				"id":       guestUser.ID,
@@ -1422,15 +1657,31 @@ func main() {
 
 		// 2) Normal users
 		user, err := getUserByUsername(payload.Username)
-		if err != nil || user.Password != payload.Password {
+		if err != nil {
 			c.JSON(401, gin.H{"error": "Invalid username or password"})
 			return
+		}
+
+		ok, needsUpgrade := verifyPassword(user.Password, payload.Password)
+		if !ok {
+			c.JSON(401, gin.H{"error": "Invalid username or password"})
+			return
+		}
+		if needsUpgrade {
+			if upgraded, err := hashPasswordBcrypt(payload.Password); err == nil {
+				upgradePasswordHash(user.ID, upgraded)
+			}
 		}
 
 		sessionID := generateRandomSessionID()
 		sftpTools.Sessions[sessionID] = user.ID
 
-		c.SetCookie("session_id", sessionID, 3600*24, "/", "", false, true)
+		maxAge := 3600 * 24
+		if payload.RememberMe {
+			maxAge = 3600 * 24 * 30
+		}
+		c.SetSameSite(sameSite)
+		c.SetCookie("session_id", sessionID, maxAge, "/", "", cookieSecure, true)
 
 		c.JSON(200, gin.H{
 			"id":       user.ID,
@@ -1448,7 +1699,8 @@ func main() {
 
 		delete(sftpTools.Sessions, sessionID)
 
-		c.SetCookie("session_id", "", -1, "/", "", false, true)
+		c.SetSameSite(sameSite)
+		c.SetCookie("session_id", "", -1, "/", "", cookieSecure, true)
 
 		c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
 	})
@@ -1938,10 +2190,7 @@ ORDER BY um.uploaded_at DESC
 		}
 		// fmt.Println("❌ USER (%s): %v", user, err)
 
-		mu.Lock()
-		progress := uploadProgress[user.ID]
-		userPending := pendingAlbums[user.ID]
-		mu.Unlock()
+		progress, userPending := uploads.Get(user.ID)
 		// fmt.Println("Current progress for user", user.ID, ":", progress)
 		// fmt.Println("Current userPending for user", user.ID, ":", userPending)
 		tree := buildTreeFromPending(userPending)
@@ -1964,6 +2213,10 @@ ORDER BY um.uploaded_at DESC
 	})
 
 	r.POST("/upload", AuthRequired(), func(c *gin.Context) {
+		if !uploadLimiter.Allow(c.ClientIP()) {
+			c.JSON(429, gin.H{"error": "Too many uploads, slow down"})
+			return
+		}
 		fmt.Println(">>> Upload handler entered")
 		user, err := sftpTools.GetCurrentUser(c)
 		if err != nil {
@@ -1986,20 +2239,30 @@ ORDER BY um.uploaded_at DESC
 			return
 		}
 
-		mu.Lock()
-		uploadProgress[user.ID] = []UploadStatus{}
+		var totalSize int64
+		var initialProgress []UploadStatus
 		for _, file := range files {
+			if file.Size > maxUploadFileSize {
+				c.JSON(400, gin.H{"error": fmt.Sprintf("File %s is too large (limit %d MB)", file.Filename, maxUploadFileSize>>20)})
+				return
+			}
+			totalSize += file.Size
+			if totalSize > maxUploadTotalSize {
+				c.JSON(400, gin.H{"error": fmt.Sprintf("Total upload size exceeds limit (%d MB)", maxUploadTotalSize>>20)})
+				return
+			}
 			if !strings.HasSuffix(strings.ToLower(file.Filename), ".flac") {
 				continue
 			}
-			uploadProgress[user.ID] = append(uploadProgress[user.ID], UploadStatus{
+			safeName := sanitizeFilename(file.Filename)
+			initialProgress = append(initialProgress, UploadStatus{
 				Artist:           "Unknown",
-				Title:            file.Filename,
+				Title:            safeName,
 				Done:             false,
-				OriginalFilename: file.Filename,
+				OriginalFilename: safeName,
 			})
 		}
-		mu.Unlock()
+		uploads.ReplaceProgress(user.ID, initialProgress)
 
 		uploaded := []Song{}
 		albumMeta := map[string]*PendingAlbum{}
@@ -2012,6 +2275,7 @@ ORDER BY um.uploaded_at DESC
 				continue
 			}
 
+			safeName := sanitizeFilename(file.Filename)
 			f, err := file.Open()
 			if err != nil {
 				fmt.Printf("❌ Failed to open file %s: %v\n", file.Filename, err)
@@ -2040,15 +2304,7 @@ ORDER BY um.uploaded_at DESC
 				}
 			}
 
-			mu.Lock()
-			for i := range uploadProgress[user.ID] {
-				if uploadProgress[user.ID][i].Title == file.Filename {
-					uploadProgress[user.ID][i].Artist = artistName
-					uploadProgress[user.ID][i].Title = title
-					break
-				}
-			}
-			mu.Unlock()
+			uploads.UpdateMeta(user.ID, safeName, artistName, title)
 
 			if _, ok := albumMeta[albumName]; !ok {
 				albumMeta[albumName] = &PendingAlbum{
@@ -2081,14 +2337,12 @@ ORDER BY um.uploaded_at DESC
 				Title:       title,
 				Duration:    duration,
 				TrackNumber: tn,
-				FileName:    file.Filename,
+				FileName:    safeName,
 				Data:        data,
 			})
 		}
 
-		mu.Lock()
-		pendingAlbums[user.ID] = albumMeta
-		mu.Unlock()
+		uploads.SetPending(user.ID, albumMeta)
 
 		for albumName, meta := range albumMeta {
 			freq := map[string]int{}
@@ -2166,21 +2420,25 @@ ORDER BY um.uploaded_at DESC
 					continue
 				}
 
-				os.MkdirAll("./temp_uploads", 0755)
+				tempDir := filepath.Join(os.TempDir(), "musicapp_uploads")
+				if err := os.MkdirAll(tempDir, 0755); err != nil {
+					fmt.Printf("❌ Failed to create temp dir %s: %v\n", tempDir, err)
+					continue
+				}
 
-				localTempPath := fmt.Sprintf("./temp_uploads/u%d_%s", user.ID, s.FileName)
-				if err := os.WriteFile(localTempPath, s.Data, 0644); err != nil {
+				localTempPath := filepath.Join(tempDir, fmt.Sprintf("u%d_%s", user.ID, filepath.Base(s.FileName)))
+				if err := os.WriteFile(localTempPath, s.Data, 0600); err != nil {
 					fmt.Printf("❌ Failed to save temp file for SFTP %s: %v\n", s.FileName, err)
 				} else {
-					fmt.Printf("[sftp] UploadToUserSFTP start user=%d local=%s filename=%s\n",
-						user.ID, localTempPath, s.FileName)
+					// fmt.Printf("[sftp] UploadToUserSFTP start user=%d local=%s filename=%s\n",
+					// 	user.ID, localTempPath, s.FileName)
 
 					if err := sftpTools.UploadToUserSFTP(user.ID, localTempPath, s.FileName); err != nil {
 						fmt.Printf("❌ SFTP upload failed user=%d file=%s err=%v\n",
 							user.ID, s.FileName, err)
 					} else {
-						fmt.Printf("[sftp] ✅ UploadToUserSFTP done user=%d local=%s\n",
-							user.ID, localTempPath)
+						// fmt.Printf("[sftp]  UploadToUserSFTP done user=%d local=%s\n",
+						// 	user.ID, localTempPath)
 					}
 
 					if err := os.Remove(localTempPath); err != nil {
@@ -2188,14 +2446,7 @@ ORDER BY um.uploaded_at DESC
 					}
 				}
 
-				mu.Lock()
-				for i := range uploadProgress[user.ID] {
-					if uploadProgress[user.ID][i].OriginalFilename == s.FileName {
-						uploadProgress[user.ID][i].Done = true
-						break
-					}
-				}
-				mu.Unlock()
+				uploads.MarkDone(user.ID, s.FileName)
 			}
 		}
 

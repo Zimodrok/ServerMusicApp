@@ -1,0 +1,244 @@
+<!doctype html>
+<html
+  lang="en"
+  class="bg-white dark:bg-zinc-950 text-gray-800 dark:text-zinc-100"
+>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FlacLibrary – Features</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      /* Tailwind’s typography plugin style if needed */
+      .prose p {
+        @apply mb-4 leading-relaxed;
+      }
+      .prose h1,
+      .prose h2,
+      .prose h3 {
+        @apply font-semibold mb-3;
+      }
+      .prose code {
+        @apply bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded text-sm;
+      }
+      .prose pre {
+        @apply bg-zinc-900 text-zinc-100 p-3 rounded-lg overflow-auto;
+      }
+    </style>
+  </head>
+
+  <body class="antialiased min-h-screen flex flex-col">
+    <header
+      class="px-8 py-6 flex justify-between items-center border-b border-zinc-200 dark:border-zinc-800"
+    >
+      <div class="flex items-center gap-3">
+        <div
+          class="w-8 h-8 rounded-lg bg-zinc-900 dark:bg-zinc-100 flex items-center justify-center"
+        >
+          <svg
+            class="w-5 h-5 text-white dark:text-zinc-900"
+            fill="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"
+            />
+          </svg>
+        </div>
+        <span class="font-semibold text-lg">FlacLibrary</span>
+      </div>
+      <nav class="flex gap-8 text-sm">
+        <a
+          href="/"
+          class="hover:underline hover:text-zinc-900 dark:hover:text-zinc-100"
+          >Home</a
+        >
+        <a
+          href="/features.html"
+          class="text-zinc-900 dark:text-zinc-100 font-medium underline"
+          >Features</a
+        >
+        <a
+          href="/download.html"
+          class="hover:underline hover:text-zinc-900 dark:hover:text-zinc-100"
+          >Download</a
+        >
+      </nav>
+    </header>
+
+    <main class="flex-1 max-w-3xl mx-auto px-6 py-12">
+      <article
+        id="markdown-content"
+        class="prose dark:prose-invert max-w-none"
+      ></article>
+    </main>
+
+    <footer
+      class="py-6 text-center text-sm text-zinc-500 dark:text-zinc-400 border-t border-zinc-200 dark:border-zinc-800"
+    >
+      © 2025 FlacLibrary. All rights reserved.
+    </footer>
+
+    <!-- Markdown Renderer -->
+    <script type="module">
+      import { marked } from "https://cdn.jsdelivr.net/npm/marked@12.0.1/lib/marked.esm.js";
+
+      const markdown = `
+# **Technical Specification (TS) for “Music Library” Web Application**
+
+## **1. General Information**
+
+* **Project Name:** Music Library
+
+* **Project Type:** Full-stack web application (client–server architecture)
+
+* **Goal:**
+  Develop an intelligent and user-friendly web application for organizing, uploading, and streaming local FLAC music libraries with real-time metadata extraction, user isolation, and dynamic synchronization.
+
+* **Target Platforms:**
+  Desktop and mobile web browsers (responsive design).
+
+* **Technology Stack:**
+
+  * **Backend:** Go (Gin framework)
+  * **Frontend:** Vue 3 + TypeScript
+  * **Database:** PostgreSQL
+  * **Additional Tools:** /flac/meta for metadata extraction, tailwind styles
+
+
+## **2. Functional Requirements**
+
+### **2.1 Backend (Server-Side)**
+
+**Core Features:**
+
+* Serve RESTful API endpoints for frontend communication.
+* Manage persistent database storage for:
+
+  * Users, roles, and authentication tokens
+  * Music albums, artists, and songs
+  * Upload metadata and user activity history
+
+**Music Upload System:**
+
+* Support drag-and-drop uploads of FLAC files.
+* Real-time extraction of:
+
+  * Artist name
+  * Album name
+  * Track title
+  * Duration and year
+  * Album cover (base64-encoded, db stored)
+* Automatic linking of uploaded songs to users’ private libraries.
+* On-the-fly library updates visible in frontend during upload progress.
+
+**Metadata Management:**
+
+* Intelligent processing of song duplicates based on metadata.
+* Optional manual editing of incorrect metadata (for admins).
+* API for re-parsing metadata using file tags or filename inference.
+
+**Guest Access:**
+
+* Temporary guest users with isolated library spaces.
+* Encrypted access links for sharing personal library in guest access.
+* Auto-cascade-cleanup of guest data after inactivity.
+
+
+**API Endpoints (examples):**
+
+| Method | Endpoint            | Description                        |
+| ------ | ------------------- | ---------------------------------- |
+| 'POST' | '/upload'           | Upload FLAC files                  |
+| 'GET'  | '/library'          | Get user’s music library           |
+| 'GET'  | '/upload/status'    | Check live parsing progress        |
+| 'GET'  | '/upload/tree'      | Retrieve tree view of parsed files |
+| 'POST' | '/api/login'        | Authenticate user                  |
+| 'POST' | '/api/register'     | Create new user                    |
+| 'GET'  | '/api/user/profile' | Get profile data                   |
+
+---
+
+### **2.2 Frontend (Client-Side)**
+
+**Main Components:**
+
+* **Library View**
+
+  * Displays albums with cover art, artist name, and release year.
+  * Grid layout with dynamic search and filtering.
+  * Base64 cover images or fallback default cover.
+
+* **Upload Interface**
+
+  * Drag-and-drop zone for uploading FLAC files.
+  * Real-time progress list - Displays and filter artist–title relations as they are parsed
+  * ASCII-style tree visualization after parsing completes.
+  * Upload popup automatically clears when user closes it.
+
+* **User Interface**
+
+  * Responsive design (desktop/mobile).
+  * Theme switching (light/dark).
+  * Profile & preferences (SFTP settings, storage path).
+  * Constaant styling for Chrome, Firefox based browsers
+
+**Interactivity:**
+
+* Real-time updates via polling or WebSocket connection.
+* Automatic library refresh as new files finish processing.
+* Smooth animations and transitions for UI updates.
+
+## **3. Advanced Features (Recommended Enhancements)**
+
+* **WebSocket Integration:** Replace polling with event-based live updates for uploads, progress, and metadata tree rendering.
+* **API Metadata Correction:** Suggest correct artist or album names by matching metadata with online databases (e.g., MusicBrainz API).
+* **Smart Search:** Full-text search and filtering by tags, artist, album, or duration.
+* **SFTP / Remote Integration:** Allow connecting to external servers for reading existing music collections.
+* **Global Metadata Edit Queue:** Admin moderation system for community-submitted metadata corrections.
+* **Offline Mode:** Cache albums and metadata for offline listening using IndexedDB.
+* **Audio Player:** Integrated FLAC-capable web player with waveform visualization.
+* **Batch Metadata Editor:** Interface for mass renaming and tag editing.
+
+
+## **4. Non-Functional Requirements**
+
+* **Performance:**
+
+  * Handle up to **100 concurrent uploads** efficiently.
+  * Response times under **400 ms** for standard API queries.
+  * Stream FLAC with minimal latency via chunked responses.
+
+* **Security:**
+
+  * Password hashing with on client side.
+  * Encrypted access tokens (JWT).
+  * Input validation and XSS/SQL injection prevention.
+  * User data isolation and unique file namespace per user.
+
+* **Scalability:**
+
+  * Modular service-oriented architecture.
+  * Ready for horizontal scaling (e.g., containerized deployment via Docker).
+
+* **Maintainability:**
+
+  * Clean, modular Go code with layered structure ('handlers', 'models', 'services').
+  * Frontend organized via Vue components and Pinia state management.
+
+## **5. Deliverables**
+
+* Fully working web application (backend + frontend).
+* PostgreSQL database schema with migration scripts.
+* Documentation for API routes and deployment.
+* Demo dataset with test music library.
+* Docker setup for local development and production.
+
+---
+`;
+
+      document.getElementById("markdown-content").innerHTML =
+        marked.parse(markdown);
+    </script>
+  </body>
+</html>
